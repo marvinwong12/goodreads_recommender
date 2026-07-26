@@ -7,7 +7,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 CURRENT_FILE = Path(__file__).resolve()
@@ -21,37 +20,12 @@ LIGHTGCN_DIR = MODEL_DIR / "lightgcn"
 # Hyperparameters
 EMBEDDING_DIM = 64
 NUM_LAYERS = 3
-BATCH_SIZE = 16384
+BATCH_SIZE = 32768
 EPOCHS = 15
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
-# Dataset for BPR Triplet Sampling (User, Pos_Item, Neg_Item)
-class BPRDataset(Dataset):
-    def __init__(self, edges_df, num_users, num_books):
-        self.num_users = num_users
-        self.num_books = num_books
-        
-        # User -> Set of positive books for fast negative sampling lookup
-        self.user_to_pos = edges_df.groupby("user_idx")["book_idx"].apply(set).to_dict()
-        self.edges = edges_df[["user_idx", "book_idx"]].values
-        
-    def __len__(self):
-        return len(self.edges)
-        
-    def __getitem__(self, idx):
-        u, pos_i = self.edges[idx]
-        
-        # Sample negative item j that user u has NOT interacted with
-        pos_set = self.user_to_pos.get(u, set())
-        neg_j = np.random.randint(0, self.num_books)
-        while neg_j in pos_set:
-            neg_j = np.random.randint(0, self.num_books)
-            
-        return u, pos_i, neg_j
-
-# PyTorch LightGCN Module
 class LightGCN(nn.Module):
     def __init__(self, num_users, num_books, embedding_dim=64, num_layers=3):
         super().__init__()
@@ -59,31 +33,25 @@ class LightGCN(nn.Module):
         self.num_books = num_books
         self.num_layers = num_layers
         
-        # Trainable initial node embeddings E_0
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.book_embedding = nn.Embedding(num_books, embedding_dim)
         
-        # Xavier Normal initialization
         nn.init.normal_(self.user_embedding.weight, std=0.1)
         nn.init.normal_(self.book_embedding.weight, std=0.1)
         
     def compute_norm_adj(self, edge_index):
-        """Builds symmetrically normalized bipartite adjacency matrix A~"""
         user_nodes = edge_index[0]
-        book_nodes = edge_index[1] + self.num_users  # Shift book indices for bipartite graph
+        book_nodes = edge_index[1] + self.num_users
         
-        # Undirected graph edges
         row = torch.cat([user_nodes, book_nodes])
         col = torch.cat([book_nodes, user_nodes])
         
         total_nodes = self.num_users + self.num_books
         
-        # Compute node degrees
         deg = torch.bincount(row, minlength=total_nodes).float()
         deg_inv_sqrt = torch.pow(deg, -0.5)
         deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
         
-        # Edge weights d_i^(-1/2) * d_j^(-1/2)
         edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
         
         indices = torch.stack([row, col])
@@ -91,16 +59,14 @@ class LightGCN(nn.Module):
         return norm_adj.coalesce()
 
     def forward(self, norm_adj):
-        # Initial embeddings layer E_0
         ego_embeddings = torch.cat([self.user_embedding.weight, self.book_embedding.weight], dim=0)
         all_embeddings = [ego_embeddings]
         
-        # Graph convolution across K layers
         for layer in range(self.num_layers):
+            # Sparse matrix multiplication propagates embeddings across the graph
             ego_embeddings = torch.sparse.mm(norm_adj, ego_embeddings)
             all_embeddings.append(ego_embeddings)
             
-        # Final embedding is uniform average across all layer outputs
         final_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1)
         
         user_final = final_embeddings[:self.num_users]
@@ -112,7 +78,6 @@ def train():
     LIGHTGCN_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Using Compute Device: {DEVICE}")
     
-    # Load graph metadata and edges
     with open(GRAPH_DIR / "graph_meta.json", "r") as f:
         meta = json.load(f)
         
@@ -122,17 +87,15 @@ def train():
     print(f"Loading K-Core Graph ({meta['num_edges']:,} edges, {num_users:,} users, {num_books:,} books)...")
     edges_df = pd.read_parquet(GRAPH_DIR / f"edges_k{meta['k_core']}.parquet")
     
-    # Build dataset and dataloader
-    dataset = BPRDataset(edges_df, num_users, num_books)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    # Push all edges directly to the GPU for extremely fast slicing
+    print("Moving dataset to VRAM...")
+    edges_tensor = torch.tensor(edges_df[["user_idx", "book_idx"]].values, dtype=torch.long, device=DEVICE)
     
-    # Initialize LightGCN Model
     model = LightGCN(num_users, num_books, embedding_dim=EMBEDDING_DIM, num_layers=NUM_LAYERS).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # Pre-compute sparse normalized adjacency matrix
-    edge_index = torch.tensor(edges_df[["user_idx", "book_idx"]].values.T, dtype=torch.long).to(DEVICE)
     print("Building normalized bipartite adjacency matrix...")
+    edge_index = edges_tensor.T
     norm_adj = model.compute_norm_adj(edge_index).to(DEVICE)
     print("✓ Graph normalized successfully!")
     
@@ -143,47 +106,53 @@ def train():
         total_loss = 0.0
         start_time = time.time()
         
-        # Compute forward pass graph propagation once per epoch
-        user_final, book_final = model(norm_adj)
+        # Shuffle edges per epoch fully on the GPU
+        perm = torch.randperm(len(edges_tensor), device=DEVICE)
+        shuffled_edges = edges_tensor[perm]
         
-        for u, pos_i, neg_j in tqdm(dataloader, desc=f"Epoch {epoch}/{EPOCHS}"):
-            u = u.to(DEVICE)
-            pos_i = pos_i.to(DEVICE)
-            neg_j = neg_j.to(DEVICE)
-            
-            u_emb = user_final[u]
-            pos_emb = book_final[pos_i]
-            neg_emb = book_final[neg_j]
-            
-            # Initial embeddings for L2 regularization
-            u_0 = model.user_embedding(u)
-            pos_0 = model.book_embedding(pos_i)
-            neg_0 = model.book_embedding(neg_j)
-            
-            # Predict scores
-            pos_scores = (u_emb * pos_emb).sum(dim=1)
-            neg_scores = (u_emb * neg_emb).sum(dim=1)
-            
-            # BPR Loss: -ln(sigmoid(pos_score - neg_score))
-            bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-10).mean()
-            
-            # L2 Regularization Loss
-            reg_loss = WEIGHT_DECAY * (u_0.norm(2).pow(2) + pos_0.norm(2).pow(2) + neg_0.norm(2).pow(2)) / BATCH_SIZE
-            
-            loss = bpr_loss + reg_loss
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
+        num_batches = len(shuffled_edges) // BATCH_SIZE + (1 if len(shuffled_edges) % BATCH_SIZE != 0 else 0)
+        
+        with tqdm(total=num_batches, desc=f"Epoch {epoch}/{EPOCHS}") as pbar:
+            for i in range(0, len(shuffled_edges), BATCH_SIZE):
+                batch = shuffled_edges[i:i + BATCH_SIZE]
+                u = batch[:, 0]
+                pos_i = batch[:, 1]
+                
+                # Fast Vectorized Negative Sampling 
+                # (With 99.94% sparsity, a random sample is a true negative 99.94% of the time)
+                neg_j = torch.randint(0, num_books, (len(batch),), device=DEVICE)
+                
+                # Forward pass across full graph graph per batch
+                user_final, book_final = model(norm_adj)
+                
+                u_emb = user_final[u]
+                pos_emb = book_final[pos_i]
+                neg_emb = book_final[neg_j]
+                
+                u_0 = model.user_embedding(u)
+                pos_0 = model.book_embedding(pos_i)
+                neg_0 = model.book_embedding(neg_j)
+                
+                pos_scores = (u_emb * pos_emb).sum(dim=1)
+                neg_scores = (u_emb * neg_emb).sum(dim=1)
+                
+                bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-10).mean()
+                reg_loss = WEIGHT_DECAY * (u_0.norm(2).pow(2) + pos_0.norm(2).pow(2) + neg_0.norm(2).pow(2)) / len(batch)
+                
+                loss = bpr_loss + reg_loss
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                pbar.update(1)
             
         elapsed = time.time() - start_time
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / num_batches
         print(f"Epoch {epoch:02d}/{EPOCHS:02d} | Loss: {avg_loss:.6f} | Time: {elapsed:.2f}s")
         
-    # Extract & Save Final Learned Embeddings
-    print("\nSaving final user and book embedding vectors...")
+    print("\nSaving final user and book embedding vectors to models/lightgcn/...")
     model.eval()
     with torch.no_grad():
         final_u, final_b = model(norm_adj)
@@ -194,8 +163,7 @@ def train():
     
     print("==========================================")
     print("✓ LightGCN Training Complete!")
-    print(f"  Saved User Embeddings : {LIGHTGCN_DIR / 'user_embeddings.npy'}")
-    print(f"  Saved Book Embeddings : {LIGHTGCN_DIR / 'book_embeddings.npy'}")
+    print(f"  Saved to : {LIGHTGCN_DIR}")
     print("==========================================")
 
 if __name__ == "__main__":

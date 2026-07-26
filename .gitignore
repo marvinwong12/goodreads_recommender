@@ -222,3 +222,5 @@ data/raw/*
 data/interim/*
 data/processed/*
 !data/.gitkeep
+
+models/
