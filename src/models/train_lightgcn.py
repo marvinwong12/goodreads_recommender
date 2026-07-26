@@ -15,7 +15,8 @@ PROJECT_ROOT = CURRENT_FILE.parents[2]
 
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 GRAPH_DIR = PROCESSED_DIR / "graph"
-LIGHTGCN_DIR = PROCESSED_DIR / "lightgcn"
+MODEL_DIR = PROJECT_ROOT / "models"
+LIGHTGCN_DIR = MODEL_DIR / "lightgcn"
 
 # Hyperparameters
 EMBEDDING_DIM = 64

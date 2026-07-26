@@ -1,0 +1,7 @@
+{
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "num_books": 258585,
+    "embedding_dim": 384,
+    "faiss_file": "books_faiss.index",
+    "book_ids_file": "book_ids.npy"
+}

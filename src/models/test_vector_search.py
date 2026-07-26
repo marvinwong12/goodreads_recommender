@@ -8,8 +8,8 @@ from sentence_transformers import SentenceTransformer
 CURRENT_FILE = Path(__file__).resolve()
 PROJECT_ROOT = CURRENT_FILE.parents[2]
 
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-VECTOR_DIR = PROCESSED_DIR / "vector_index"
+MODEL_DIR = PROJECT_ROOT / "models"
+VECTOR_DIR = MODEL_DIR / "vector_index"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 def load_vector_search_engine():
