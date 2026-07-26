@@ -1,0 +1,30 @@
+# Data Engineering & ETL
+pyspark             
+pyarrow                 
+pandas                 
+numpy             
+
+# EDA & Visualization
+jupyter                  
+matplotlib               
+seaborn     
+wordcloud             
+
+# Machine Learning & Ranking
+scikit-learn             
+lightgbm                 
+# catboost            
+
+# Deep Learning & Graph Neural Networks
+torch                  
+torch_geometric      
+
+
+# Embeddings & Vector Search (Semantic Retrieval)
+sentence-transformers    
+faiss-cpu             
+
+# MLOps & Utilities
+tqdm                  
+wandb              
+python-dotenv          
