@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import torch.nn.functional as F
 
 CURRENT_FILE = Path(__file__).resolve()
 PROJECT_ROOT = CURRENT_FILE.parents[2]
@@ -20,11 +21,11 @@ LIGHTGCN_DIR = MODEL_DIR / "lightgcn"
 # Hyperparameters
 EMBEDDING_DIM = 64
 NUM_LAYERS = 3
-BATCH_SIZE = 32768
+BATCH_SIZE = 32768  # KEEP BIG
 EPOCHS = 15
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class LightGCN(nn.Module):
     def __init__(self, num_users, num_books, embedding_dim=64, num_layers=3):
@@ -136,8 +137,8 @@ def train():
                 pos_scores = (u_emb * pos_emb).sum(dim=1)
                 neg_scores = (u_emb * neg_emb).sum(dim=1)
                 
-                bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-10).mean()
-                reg_loss = WEIGHT_DECAY * (u_0.norm(2).pow(2) + pos_0.norm(2).pow(2) + neg_0.norm(2).pow(2)) / len(batch)
+                bpr_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
+                reg_loss = (1/2) * WEIGHT_DECAY * (u_0.norm(2).pow(2) + pos_0.norm(2).pow(2) + neg_0.norm(2).pow(2)) / len(batch)
                 
                 loss = bpr_loss + reg_loss
                 
