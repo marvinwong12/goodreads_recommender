@@ -1,16 +1,25 @@
 import numpy as np
 
-def min_max_normalize(scores):
-    """Normalizes an array of scores to a strict 0.0 - 1.0 range."""
-    scores = np.array(scores, dtype=np.float32)
-    min_val = np.min(scores)
-    max_val = np.max(scores)
+def min_max_normalize(scores: np.ndarray) -> np.ndarray:
+    """Safely min-max normalizes scores to [0, 1] while ignoring -inf/nan values."""
+    finite_mask = np.isfinite(scores)
     
-    # Safety check: if all scores are identical, return 0.5 for all
-    if max_val == min_val:
-        return np.full_like(scores, 0.5)
+    if not np.any(finite_mask):
+        return np.zeros_like(scores)
         
-    return (scores - min_val) / (max_val - min_val)
+    min_val = np.min(scores[finite_mask])
+    max_val = np.max(scores[finite_mask])
+    
+    denom = max_val - min_val
+    if denom == 0:
+        # Avoid division by zero if all scores are identical
+        scaled = np.zeros_like(scores)
+        scaled[~finite_mask] = -np.inf
+        return scaled
+        
+    scaled = np.full_like(scores, -np.inf, dtype=np.float64)
+    scaled[finite_mask] = (scores[finite_mask] - min_val) / denom
+    return scaled
 
 def fuse_scores(lightgcn_scores, semantic_scores, user_interaction_count, decay_rate=0.05, min_alpha=0.15):
     """
