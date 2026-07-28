@@ -43,15 +43,21 @@ def build_hard_negative_dataset():
     sem_dim = sem_embs_raw.shape[1]
     aligned_sem_embs = np.zeros((num_books, sem_dim))
     
-    # Create a quick lookup for book_id -> book_idx
-    id_to_idx = dict(zip(book_map['book_id'], book_map['book_idx']))
+    # Force keys to standard Python strings to bypass Arrow formatting quirks
+    id_to_idx = {str(k): v for k, v in zip(book_map['book_id'], book_map['book_idx'])}
     
     for i, b_id in enumerate(sem_ids_raw):
-        # b_id might be a string or int depending on your DB, ensure it matches book_map
-        b_id_val = int(b_id) if str(b_id).isdigit() else b_id 
-        if b_id_val in id_to_idx:
-            b_idx = id_to_idx[b_id_val]
+        # Force the Vector DB ID to string to guarantee a type match
+        b_id_str = str(b_id)
+        if b_id_str in id_to_idx:
+            b_idx = id_to_idx[b_id_str]
             aligned_sem_embs[b_idx] = sem_embs_raw[i]
+
+    # Check semantic scores are correct
+    matched_count = np.sum(np.any(aligned_sem_embs != 0, axis=1))
+    print(f"\n[DEBUG] Successfully matched {matched_count:,} out of {num_books:,} semantic embeddings!")
+    if matched_count == 0:
+        raise ValueError("Mapping failed again! All semantic vectors are zero.")
             
     # Normalize semantic vectors for fast Cosine Similarity (dot product of normalized vectors)
     norms = np.linalg.norm(aligned_sem_embs, axis=1, keepdims=True)
@@ -62,7 +68,10 @@ def build_hard_negative_dataset():
     positives = train_interactions[train_interactions['is_engagement'] == 1].copy()
     positives = positives.merge(user_map, on='user_id').merge(book_map, on='book_id')
     
-    user_metadata = positives[['user_idx', 'user_avg_rating', 'user_explicit_rating_count']].drop_duplicates().set_index('user_idx')
+    # Pre-compute dictionaries for lightning-fast lookups in the loop
+    user_metadata_df = positives[['user_idx', 'user_avg_rating', 'user_explicit_rating_count']].drop_duplicates().set_index('user_idx')
+    user_metadata_dict = user_metadata_df.to_dict('index') # Converts to {u_idx: {'user_avg_rating': x, 'user_explicit_rating_count': y}}
+    
     user_to_positives = positives.groupby('user_idx')['book_idx'].apply(list).to_dict()
     pos_year_map = positives.set_index(['user_idx', 'book_idx'])['interaction_year'].to_dict()
     
@@ -90,9 +99,10 @@ def build_hard_negative_dataset():
         semantic_scores = np.dot(aligned_sem_embs, user_sem_profile)
         
         # C. Apply Dynamic Fusion
-        u_count = user_metadata.loc[u_idx, 'user_explicit_rating_count']
+        # FAST LOOKUP: Use the dictionary instead of pandas .loc
+        u_meta = user_metadata_dict[u_idx]
+        u_count = u_meta['user_explicit_rating_count']
         
-        # Using the fuse_scores function you built!
         fused_scores, alpha_used = fuse_scores(
             lightgcn_scores=lightgcn_scores,
             semantic_scores=semantic_scores,
@@ -100,7 +110,9 @@ def build_hard_negative_dataset():
         )
         
         # D. Pull Top K Candidates
-        top_k_indices = np.argsort(fused_scores)[::-1][:STAGE_1_TOP_K]
+        # FAST SORT: O(N) partition instead of O(N log N) full sort
+        # This grabs the indices of the highest K values without wasting time sorting them internally
+        top_k_indices = np.argpartition(fused_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
         all_candidate_indices = set(top_k_indices).union(set(true_pos_indices))
         
         # E. Build Training Rows
@@ -115,7 +127,7 @@ def build_hard_negative_dataset():
                 'lightgcn_score': lightgcn_scores[b_idx],
                 'semantic_score': semantic_scores[b_idx],
                 'fused_score': fused_scores[b_idx], 
-                'user_avg_rating': user_metadata.loc[u_idx, 'user_avg_rating'],
+                'user_avg_rating': u_meta['user_avg_rating'], # Use dictionary here too
                 'user_explicit_rating_count': u_count,
                 'interaction_year': int_year
             })
