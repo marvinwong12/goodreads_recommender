@@ -34,7 +34,8 @@ def objective(trial, X_train, y_train, X_val, y_val, scale_pos_weight):
         'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
         'scale_pos_weight': scale_pos_weight,
         'objective': 'binary:logistic',
-        'tree_method': 'hist', # Change to 'gpu_hist' if using Colab/GPU
+        'tree_method': 'hist', 
+        'device': 'cuda',
         'eval_metric': 'auc',
         'early_stopping_rounds': 20,
         'n_jobs': -1 # Use all CPU cores
