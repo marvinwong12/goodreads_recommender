@@ -65,46 +65,50 @@ def clean_and_process():
     print("Processing User Rating Bias & Interaction Features...")
     df_interactions = spark.read.parquet(f"{INTERIM_DIR}/interactions.parquet")
     
-    # Calculate user baseline stats considering EXPLICIT ratings (1-5 stars)
-    explicit_ratings = df_interactions.filter(F.col("rating") > 0)
+    # 1. Extract temporal split FIRST
+    interactions_cleaned = (
+        df_interactions
+        .withColumn("interaction_year", F.year("interaction_date"))
+        .withColumn("is_train", F.col("interaction_date") < F.lit(TEMPORAL_CUTOFF_DATE))
+    )
     
-    user_stats = explicit_ratings.groupBy("user_id").agg(
+    # 2. Calculate user stats ONLY on the training data to prevent leakage
+    explicit_train_ratings = interactions_cleaned.filter(
+        (F.col("rating") > 0) & (F.col("is_train") == True)
+    )
+    
+    user_stats = explicit_train_ratings.groupBy("user_id").agg(
         F.mean("rating").cast(FloatType()).alias("user_avg_rating"),
         F.count("rating").alias("user_explicit_rating_count")
     )
     
-    # Global average rating for cold-start users without explicit ratings
-    global_avg_row = explicit_ratings.select(F.mean("rating")).first()
+    # Global average rating for cold-start users
+    global_avg_row = explicit_train_ratings.select(F.mean("rating")).first()
     global_avg_rating = float(global_avg_row[0]) if global_avg_row else 3.95
     
-    # Join user stats back into interactions
-    interactions_cleaned = df_interactions.join(user_stats, on="user_id", how="left")
+    # 3. Join user stats back into the FULL interactions dataset
+    interactions_cleaned = interactions_cleaned.join(user_stats, on="user_id", how="left")
     
-    # Fill missing user stats with platform defaults
     interactions_cleaned = interactions_cleaned.fillna({
         "user_avg_rating": global_avg_rating,
         "user_explicit_rating_count": 0
     })
     
-    # Join publication year to calculate interaction-time book age
+    # 4. Join publication year
     book_years = cleaned_books.select("book_id", "publication_year")
     interactions_cleaned = interactions_cleaned.join(book_years, on="book_id", how="left")
     
-    # Extract temporal values
-    interactions_cleaned = (
+    # 5. Apply remaining feature engineering
+    interactions_final = (
         interactions_cleaned
-        .withColumn("interaction_year", F.year("interaction_date"))
-        # Feature 3: Rating Delta (Explicit Rating - User Mean)
         .withColumn(
             "rating_delta",
             F.when(F.col("rating") > 0, F.col("rating") - F.col("user_avg_rating")).otherwise(0.0)
         )
-        # Feature 4: Combined Engagement Target (Captures 1.71M read-but-unrated books)
         .withColumn(
             "is_engagement",
             F.when((F.col("is_read") == 1) | (F.col("rating") >= 3), 1).otherwise(0)
         )
-        # Feature 5: Book age when user interacted with it
         .withColumn(
             "book_age_at_interaction",
             F.when(
@@ -112,8 +116,7 @@ def clean_and_process():
                 F.greatest(F.lit(0), F.col("interaction_year") - F.col("publication_year"))
             ).otherwise(None)
         )
-        # Feature 6: Temporal train/test split indicator (True = Train, False = Validation/Test)
-        .withColumn("is_train", F.col("interaction_date") < F.lit(TEMPORAL_CUTOFF_DATE))
+        .drop("publication_year")
     )
     
     # Drop temp join column to keep dataset lean
