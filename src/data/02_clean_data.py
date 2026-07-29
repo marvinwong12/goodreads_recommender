@@ -10,7 +10,13 @@ PROJECT_ROOT = CURRENT_FILE.parents[2]
 INTERIM_DIR = str(PROJECT_ROOT / "data" / "interim")
 PROCESSED_DIR = str(PROJECT_ROOT / "data" / "processed")
 
-# Temporal split cutoff date based on EDA timeline audit
+# Temporal split cutoffs based on EDA timeline audit
+# Interactions are split into three chronological blocks so no stage ever scores
+# candidates using a signal that was fit on those exact same edges:
+#   1. [..., GCN_FIT_CUTOFF_DATE)          -> used to fit LightGCN / semantic user profiles
+#   2. [GCN_FIT_CUTOFF_DATE, TEMPORAL_CUTOFF_DATE) -> held out from stage 1, used as XGBoost ranker labels
+#   3. [TEMPORAL_CUTOFF_DATE, ...)         -> final held-out test set
+GCN_FIT_CUTOFF_DATE = "2017-01-01 00:00:00"
 TEMPORAL_CUTOFF_DATE = "2017-07-01 00:00:00"
 
 def clean_and_process():
@@ -70,11 +76,14 @@ def clean_and_process():
         df_interactions
         .withColumn("interaction_year", F.year("interaction_date"))
         .withColumn("is_train", F.col("interaction_date") < F.lit(TEMPORAL_CUTOFF_DATE))
+        .withColumn("is_gcn_fit", F.col("interaction_date") < F.lit(GCN_FIT_CUTOFF_DATE))
     )
-    
-    # 2. Calculate user stats ONLY on the training data to prevent leakage
+
+    # 2. Calculate user stats ONLY on the GCN-fit slice to prevent leakage:
+    # these stats are used as ranker features, so they must reflect what was
+    # knowable *before* the ranker-label window, not the label window itself.
     explicit_train_ratings = interactions_cleaned.filter(
-        (F.col("rating") > 0) & (F.col("is_train") == True)
+        (F.col("rating") > 0) & (F.col("is_gcn_fit") == True)
     )
     
     user_stats = explicit_train_ratings.groupBy("user_id").agg(
@@ -118,10 +127,7 @@ def clean_and_process():
         )
         .drop("publication_year")
     )
-    
-    # Drop temp join column to keep dataset lean
-    interactions_final = interactions_cleaned.drop("publication_year")
-    
+
     interactions_final.write.mode("overwrite").parquet(f"{PROCESSED_DIR}/interactions_clean.parquet")
     print(f"✓ Saved cleaned interactions to {PROCESSED_DIR}/interactions_clean.parquet")
     

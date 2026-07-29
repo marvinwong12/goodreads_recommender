@@ -21,9 +21,15 @@ def build_k_core_graph(k: int = 10):
     print("Loading clean interactions...")
     df_interactions = spark.read.parquet(str(PROCESSED_DIR / "interactions_clean.parquet"))
     
-    # Rule 1: Train-only edges with positive engagement (read or rating >= 3)
+    # Rule 1: GCN-fit-only edges with positive engagement (read or rating >= 3).
+    # Deliberately uses `is_gcn_fit` (a strict subset of `is_train`) rather than
+    # `is_train` so the interactions held back for XGBoost ranker labels
+    # (is_train & ~is_gcn_fit) are never seen by LightGCN during training.
+    # Otherwise the BPR loss directly optimizes pos_score - neg_score on the
+    # exact edges that later become the ranker's positive labels, and the
+    # resulting lightgcn_score becomes a near-perfect (leaked) predictor.
     train_edges = df_interactions.filter(
-        (F.col("is_train") == True) & (F.col("is_engagement") == 1)
+        (F.col("is_gcn_fit") == True) & (F.col("is_engagement") == 1)
     ).select("user_id", "book_id")
     
     initial_count = train_edges.count()
