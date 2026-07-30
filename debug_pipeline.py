@@ -41,7 +41,7 @@ norms = np.linalg.norm(aligned_sem_embs, axis=1, keepdims=True)
 aligned_sem_embs = np.divide(aligned_sem_embs, norms, out=np.zeros_like(aligned_sem_embs), where=norms!=0)
 
 # XGBoost
-ranker = xgb.XGBClassifier()
+ranker = xgb.XGBRanker()
 ranker.load_model(XGBOOST_DIR / "ranker_model.json")
 
 # Lookups
@@ -105,9 +105,9 @@ for u_idx in sample_users:
         is_long_arr[f_top100], book_age_arr[f_top100]
     ))
     X_cand = pd.DataFrame(c_np, columns=feature_names)
-    probs = ranker.predict_proba(X_cand)[:, 1]
-    
-    xgb_top10 = f_top100[np.argsort(probs)[::-1][:10]]
+    scores = ranker.predict(X_cand)
+
+    xgb_top10 = f_top100[np.argsort(scores)[::-1][:10]]
     if any(b in gt_set for b in xgb_top10): xgb_hr10 += 1
 
 N = len(sample_users)
@@ -119,6 +119,6 @@ print("=====================================================")
 
 
 import xgboost as xgb
-ranker = xgb.XGBClassifier()
+ranker = xgb.XGBRanker()
 ranker.load_model("models/xgboost/ranker_model.json")
 print("Expected XGBoost Features:", ranker.get_booster().feature_names)

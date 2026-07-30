@@ -67,7 +67,7 @@ def evaluate():
     aligned_sem_embs = np.divide(aligned_sem_embs, norms, out=np.zeros_like(aligned_sem_embs), where=norms!=0)
     
     # 3. Load Trained Ranker
-    ranker = xgb.XGBClassifier()
+    ranker = xgb.XGBRanker()
     ranker.load_model(XGBOOST_DIR / "ranker_model.json")
     
     # 4. Prepare Evaluation Lookups
@@ -150,10 +150,10 @@ def evaluate():
         ))
         
         X_candidates = pd.DataFrame(X_candidates_np, columns=feature_names)
-        ranker_probs = ranker.predict_proba(X_candidates)[:, 1]
-        
-        # Sort by ranker probabilities (Descending)
-        reranked_order = np.argsort(ranker_probs)[::-1]
+        ranker_scores = ranker.predict(X_candidates)
+
+        # Sort by ranker scores (Descending)
+        reranked_order = np.argsort(ranker_scores)[::-1]
         final_ranked_book_indices = candidate_indices[reranked_order]
         
         # --- METRIC COMPUTATION ---

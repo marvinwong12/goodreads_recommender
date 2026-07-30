@@ -4,8 +4,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 import optuna
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import GroupShuffleSplit
 import matplotlib.pyplot as plt
 import warnings
 
@@ -19,12 +18,39 @@ MODEL_DIR = PROJECT_ROOT / "models" / "xgboost"
 
 # --- Configuration ---
 NUM_OPTUNA_TRIALS = 30  # Increase to 50-100 for overnight training
+NDCG_K = 10
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-def objective(trial, X_train, y_train, X_val, y_val, scale_pos_weight):
+
+def mean_ndcg_at_k(y_true, y_score, qid, k=NDCG_K):
+    """
+    Average per-user (per-qid) NDCG@k. Unlike a pooled AUC, this measures
+    within-user ranking quality directly, which is what HR@k/NDCG@k in
+    production actually depend on.
+    """
+    frame = pd.DataFrame({"qid": qid, "y_true": y_true, "y_score": y_score})
+    ndcgs = []
+
+    for _, group in frame.groupby("qid", sort=False):
+        n_pos = int(group["y_true"].sum())
+        if n_pos == 0:
+            continue
+
+        ranked = group.sort_values("y_score", ascending=False)["y_true"].to_numpy()
+        ranks = np.arange(1, len(ranked) + 1)
+        dcg = np.sum(ranked[:k] / np.log2(ranks[:k] + 1))
+
+        ideal_hits = min(n_pos, k)
+        idcg = np.sum(1.0 / np.log2(np.arange(1, ideal_hits + 1) + 1))
+
+        ndcgs.append(dcg / idcg if idcg > 0 else 0.0)
+
+    return float(np.mean(ndcgs)) if ndcgs else 0.0
+
+
+def objective(trial, X_train, y_train, qid_train, X_val, y_val, qid_val):
     """Optuna objective function to find the best hyperparameters."""
-    
-    # 1. Define the hyperparameter search space
+
     param_grid = {
         'n_estimators': trial.suggest_int('n_estimators', 200, 800),
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
@@ -32,103 +58,105 @@ def objective(trial, X_train, y_train, X_val, y_val, scale_pos_weight):
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
         'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-        'scale_pos_weight': scale_pos_weight,
-        'objective': 'binary:logistic',
-        'tree_method': 'hist', 
+        'objective': 'rank:ndcg',
+        'tree_method': 'hist',
         'device': 'cuda',
-        'eval_metric': 'auc',
+        'eval_metric': f'ndcg@{NDCG_K}',
         'early_stopping_rounds': 20,
-        'n_jobs': -1 # Use all CPU cores
+        'n_jobs': -1
     }
-    
-    # 2. Initialize and train the model
-    model = xgb.XGBClassifier(**param_grid)
-    
+
+    model = xgb.XGBRanker(**param_grid)
+
     model.fit(
-        X_train, y_train,
+        X_train, y_train, qid=qid_train,
         eval_set=[(X_val, y_val)],
-        verbose=False # Keep terminal clean during tuning
+        eval_qid=[qid_val],
+        verbose=False
     )
-    
-    # 3. Evaluate and return AUC
-    val_preds = model.predict_proba(X_val)[:, 1]
-    auc = roc_auc_score(y_val, val_preds)
-    
-    return auc
+
+    val_preds = model.predict(X_val)
+    return mean_ndcg_at_k(y_val, val_preds, qid_val, k=NDCG_K)
+
 
 def train():
     print("Loading tabular dataset...")
     df = pd.read_parquet(DATA_DIR / "xgboost_dataset.parquet")
-    
-    # Added 'fused_score' to the features!
+
     features = [
-        'lightgcn_score', 
-        'semantic_score', 
-        'fused_score', 
-        'user_avg_rating', 
+        'lightgcn_score',
+        'semantic_score',
+        'fused_score',
+        'user_avg_rating',
         'user_explicit_rating_count',
         'is_long_book',
         'book_age_at_interaction'
     ]
-    
-    X = df[features]
-    y = df['target']
-    
-    # Calculate class imbalance weight
-    num_neg = (y == 0).sum()
-    num_pos = (y == 1).sum()
-    scale_pos_weight = num_neg / num_pos
-    print(f"Calculated scale_pos_weight: {scale_pos_weight:.2f} (Positives: {num_pos:,}, Negatives: {num_neg:,})")
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    
-    print(f"Training on {len(X_train):,} rows. Validating on {len(X_val):,} rows...")
+
+    # Ranking objectives require rows for the same query (user) to be
+    # contiguous, and train/val must never split a user's candidates across
+    # both sides (that would leak the user's other candidates' relative
+    # ordering context and also makes qid grouping meaningless).
+    df = df.sort_values('user_idx').reset_index(drop=True)
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, val_idx = next(splitter.split(df, groups=df['user_idx']))
+
+    df_train = df.iloc[train_idx].sort_values('user_idx').reset_index(drop=True)
+    df_val = df.iloc[val_idx].sort_values('user_idx').reset_index(drop=True)
+
+    X_train, y_train, qid_train = df_train[features], df_train['target'], df_train['user_idx']
+    X_val, y_val, qid_val = df_val[features], df_val['target'], df_val['user_idx']
+
+    print(f"Training on {len(X_train):,} rows ({qid_train.nunique():,} users). "
+          f"Validating on {len(X_val):,} rows ({qid_val.nunique():,} users)...")
     print(f"\n--- Starting Optuna Hyperparameter Tuning ({NUM_OPTUNA_TRIALS} Trials) ---")
-    
-    # Create the Optuna study (we want to maximize AUC)
+
+    # Create the Optuna study (we want to maximize mean NDCG@10)
     study = optuna.create_study(direction='maximize', study_name="xgboost_ranker")
-    
-    # Run the optimization
+
     study.optimize(
-        lambda trial: objective(trial, X_train, y_train, X_val, y_val, scale_pos_weight),
+        lambda trial: objective(trial, X_train, y_train, qid_train, X_val, y_val, qid_val),
         n_trials=NUM_OPTUNA_TRIALS
     )
-    
+
     print("\n====================================")
-    print(f"✓ Tuning Complete! Best AUC: {study.best_value:.4f}")
+    print(f"✓ Tuning Complete! Best Mean NDCG@{NDCG_K}: {study.best_value:.4f}")
     print("====================================\n")
-    
+
     print("Best Hyperparameters:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
-        
+
     # --- Train Final Model ---
     print("\nTraining final model with best parameters...")
     final_params = study.best_params
-    final_params['scale_pos_weight'] = scale_pos_weight
-    final_params['objective'] = 'binary:logistic'
+    final_params['objective'] = 'rank:ndcg'
     final_params['tree_method'] = 'hist'
-    final_params['eval_metric'] = 'auc'
+    final_params['eval_metric'] = f'ndcg@{NDCG_K}'
     final_params['early_stopping_rounds'] = 20
-    
-    best_model = xgb.XGBClassifier(**final_params)
+
+    best_model = xgb.XGBRanker(**final_params)
     best_model.fit(
-        X_train, y_train,
+        X_train, y_train, qid=qid_train,
         eval_set=[(X_train, y_train), (X_val, y_val)],
-        verbose=100 # Show progress every 100 trees
+        eval_qid=[qid_train, qid_val],
+        verbose=100  # Show progress every 100 trees
     )
-    
+
     # --- Save Artifacts ---
     model_path = MODEL_DIR / "ranker_model.json"
     best_model.save_model(model_path)
     print(f"\n✓ Best model saved to {model_path}")
-    
+
+    final_val_preds = best_model.predict(X_val)
+    final_ndcg = mean_ndcg_at_k(y_val, final_val_preds, qid_val, k=NDCG_K)
+    print(f"✓ Final validation Mean NDCG@{NDCG_K}: {final_ndcg:.4f}")
+
     # Plot feature importance
     importance = best_model.feature_importances_
     sorted_idx = np.argsort(importance)
-    
+
     plt.figure(figsize=(10, 6))
     plt.barh(range(len(sorted_idx)), importance[sorted_idx], align='center')
     plt.yticks(range(len(sorted_idx)), [features[i] for i in sorted_idx])
@@ -136,6 +164,7 @@ def train():
     plt.tight_layout()
     plt.savefig(MODEL_DIR / "feature_importance.png")
     print("✓ Feature importance plot saved.")
+
 
 if __name__ == "__main__":
     train()
