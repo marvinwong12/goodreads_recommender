@@ -21,6 +21,27 @@ NUM_OPTUNA_TRIALS = 30  # Increase to 50-100 for overnight training
 NDCG_K = 10
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+FEATURES = [
+    'lightgcn_score',
+    'semantic_score',
+    'fused_score',
+    'user_avg_rating',
+    'user_explicit_rating_count',
+    'is_long_book',
+    'book_age_at_interaction'
+]
+
+# Force non-decreasing relevance w.r.t. the three stage-1 score features.
+# Without this, unconstrained trees can fit a non-monotonic (and
+# non-extrapolating) function of fused_score/lightgcn_score/semantic_score
+# that only holds inside the training window's score range, actively
+# scrambling an otherwise-good ordering once served on real/future data.
+# 1 = monotonic increasing, 0 = unconstrained.
+MONOTONE_CONSTRAINTS = tuple(
+    1 if f in ('lightgcn_score', 'semantic_score', 'fused_score') else 0
+    for f in FEATURES
+)
+
 
 def mean_ndcg_at_k(y_true, y_score, qid, k=NDCG_K):
     """
@@ -63,6 +84,7 @@ def objective(trial, X_train, y_train, qid_train, X_val, y_val, qid_val):
         'device': 'cuda',
         'eval_metric': f'ndcg@{NDCG_K}',
         'early_stopping_rounds': 20,
+        'monotone_constraints': MONOTONE_CONSTRAINTS,
         'n_jobs': -1
     }
 
@@ -83,15 +105,7 @@ def train():
     print("Loading tabular dataset...")
     df = pd.read_parquet(DATA_DIR / "xgboost_dataset.parquet")
 
-    features = [
-        'lightgcn_score',
-        'semantic_score',
-        'fused_score',
-        'user_avg_rating',
-        'user_explicit_rating_count',
-        'is_long_book',
-        'book_age_at_interaction'
-    ]
+    features = FEATURES
 
     # Ranking objectives require rows for the same query (user) to be
     # contiguous, and train/val must never split a user's candidates across
@@ -133,8 +147,10 @@ def train():
     final_params = study.best_params
     final_params['objective'] = 'rank:ndcg'
     final_params['tree_method'] = 'hist'
+    final_params['device'] = 'cuda'
     final_params['eval_metric'] = f'ndcg@{NDCG_K}'
     final_params['early_stopping_rounds'] = 20
+    final_params['monotone_constraints'] = MONOTONE_CONSTRAINTS
 
     best_model = xgb.XGBRanker(**final_params)
     best_model.fit(

@@ -97,8 +97,24 @@ def evaluate():
     test_users = list(user_to_test_pos.keys())
     print(f"Evaluating {len(test_users):,} test users...")
     
-    metrics = {'hr@5': [], 'hr@10': [], 'ndcg@5': [], 'ndcg@10': [], 'mrr@10': []}
-    
+    metric_names = ['hr@5', 'hr@10', 'ndcg@5', 'ndcg@10', 'mrr@10']
+    metrics = {
+        'fused': {m: [] for m in metric_names},
+        'xgboost': {m: [] for m in metric_names},
+    }
+
+    def record_metrics(stage, hits_binary):
+        metrics[stage]['hr@5'].append(1.0 if any(hits_binary[:5]) else 0.0)
+        metrics[stage]['hr@10'].append(1.0 if any(hits_binary[:10]) else 0.0)
+        metrics[stage]['ndcg@5'].append(compute_ndcg_at_k(hits_binary, 5))
+        metrics[stage]['ndcg@10'].append(compute_ndcg_at_k(hits_binary, 10))
+        mrr = 0.0
+        for rank, hit in enumerate(hits_binary[:10], start=1):
+            if hit:
+                mrr = 1.0 / rank
+                break
+        metrics[stage]['mrr@10'].append(mrr)
+
     feature_names = [
         'lightgcn_score', 'semantic_score', 'fused_score', 
         'user_avg_rating', 'user_explicit_rating_count', 
@@ -135,7 +151,13 @@ def evaluate():
         
         # 3. Retrieve Top K candidates
         candidate_indices = np.argpartition(fused_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
-        
+
+        # --- BASELINE: Fused-score-only ranking (no XGBoost re-ranking) ---
+        fused_order = np.argsort(fused_scores[candidate_indices])[::-1]
+        fused_ranked_book_indices = candidate_indices[fused_order]
+        fused_hits_binary = [b_idx in ground_truth_set for b_idx in fused_ranked_book_indices]
+        record_metrics('fused', fused_hits_binary)
+
         # --- STAGE 2: Vectorized XGBoost Re-ranking ---
         c_lightgcn = lightgcn_scores[candidate_indices]
         c_semantic = semantic_scores[candidate_indices]
@@ -158,29 +180,21 @@ def evaluate():
         
         # --- METRIC COMPUTATION ---
         hits_binary = [b_idx in ground_truth_set for b_idx in final_ranked_book_indices]
-        
-        metrics['hr@5'].append(1.0 if any(hits_binary[:5]) else 0.0)
-        metrics['hr@10'].append(1.0 if any(hits_binary[:10]) else 0.0)
-        metrics['ndcg@5'].append(compute_ndcg_at_k(hits_binary, 5))
-        metrics['ndcg@10'].append(compute_ndcg_at_k(hits_binary, 10))
-        
-        mrr = 0.0
-        for rank, hit in enumerate(hits_binary[:10], start=1):
-            if hit:
-                mrr = 1.0 / rank
-                break
-        metrics['mrr@10'].append(mrr)
+        record_metrics('xgboost', hits_binary)
 
     print("\n==============================================")
     print("      FINAL TWO-STAGE PIPELINE EVALUATION     ")
     print("==============================================")
     final_summary = {}
-    for metric_name, values in metrics.items():
-        avg_val = np.mean(values)
-        final_summary[metric_name] = round(float(avg_val), 4)
-        print(f"  {metric_name.upper():<10}: {avg_val:.4f}")
+    for stage in ['fused', 'xgboost']:
+        print(f"\n--- {stage.upper()} {'(Stage 1 baseline, no re-ranking)' if stage == 'fused' else '(Stage 1 + Stage 2)'} ---")
+        final_summary[stage] = {}
+        for metric_name in metric_names:
+            avg_val = np.mean(metrics[stage][metric_name])
+            final_summary[stage][metric_name] = round(float(avg_val), 4)
+            print(f"  {metric_name.upper():<10}: {avg_val:.4f}")
     print("==============================================")
-    
+
     out_file = RESULTS_DIR / "test_evaluation_results.json"
     with open(out_file, "w") as f:
         json.dump(final_summary, f, indent=4)
