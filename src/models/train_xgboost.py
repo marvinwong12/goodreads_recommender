@@ -27,18 +27,24 @@ FEATURES = [
     'fused_score',
     'user_avg_rating',
     'user_explicit_rating_count',
+    'author_read_count',
+    'book_average_rating',
+    'book_log_ratings_count',
 ]
 
-# Force non-decreasing relevance w.r.t. the three stage-1 score features.
-# Without this, unconstrained trees can fit a non-monotonic (and
-# non-extrapolating) function of fused_score/lightgcn_score/semantic_score
-# that only holds inside the training window's score range, actively
-# scrambling an otherwise-good ordering once served on real/future data.
+# Force non-decreasing relevance w.r.t. the stage-1 score features and the
+# book popularity priors. Without this, unconstrained trees can fit a
+# non-monotonic (and non-extrapolating) function of these scores that only
+# holds inside the training window's range, actively scrambling an otherwise-
+# good ordering once served on real/future data. `author_read_count` is left
+# unconstrained: more prior reads of an author is a plausible but not
+# guaranteed-monotonic signal (readers do deliberately branch out).
 # 1 = monotonic increasing, 0 = unconstrained.
-MONOTONE_CONSTRAINTS = tuple(
-    1 if f in ('lightgcn_score', 'semantic_score', 'fused_score') else 0
-    for f in FEATURES
-)
+MONOTONE_FEATURES = {
+    'lightgcn_score', 'semantic_score', 'fused_score',
+    'book_average_rating', 'book_log_ratings_count',
+}
+MONOTONE_CONSTRAINTS = tuple(1 if f in MONOTONE_FEATURES else 0 for f in FEATURES)
 
 
 def mean_ndcg_at_k(y_true, y_score, qid, k=NDCG_K):

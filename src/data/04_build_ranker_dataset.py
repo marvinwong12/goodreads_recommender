@@ -1,4 +1,5 @@
 import sys
+from collections import Counter
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -46,7 +47,26 @@ def build_hard_negative_dataset():
             
     norms = np.linalg.norm(aligned_sem_embs, axis=1, keepdims=True)
     aligned_sem_embs = np.divide(aligned_sem_embs, norms, out=np.zeros_like(aligned_sem_embs), where=norms!=0)
-    
+
+    # Static per-book arrays: author id (for user-author affinity) and global
+    # popularity priors (avg rating / log ratings count), indexed by book_idx.
+    print("Building static book feature arrays...")
+    book_meta_global = book_map.merge(
+        books[['book_id', 'primary_author_id', 'average_rating', 'ratings_count']],
+        on='book_id', how='left'
+    )
+    author_id_arr = np.full(num_books, None, dtype=object)
+    avg_rating_arr = np.full(num_books, books['average_rating'].mean(), dtype=np.float64)
+    log_ratings_count_arr = np.zeros(num_books, dtype=np.float64)
+
+    for row in book_meta_global.itertuples(index=False):
+        b_idx = int(row.book_idx)
+        author_id_arr[b_idx] = row.primary_author_id
+        if pd.notnull(row.average_rating):
+            avg_rating_arr[b_idx] = row.average_rating
+        if pd.notnull(row.ratings_count):
+            log_ratings_count_arr[b_idx] = np.log1p(row.ratings_count)
+
     # 2. Prepare User Interaction Data
     #
     # --- LEAK FIX: disjoint history vs. label windows ---
@@ -90,6 +110,12 @@ def build_hard_negative_dataset():
         u_count = u_meta['user_explicit_rating_count']
         ref_year = user_max_year.get(u_idx, MAX_DATASET_YEAR)
 
+        # Author affinity: counts of prior (pre-cutoff) reads per author, so a
+        # candidate by an author the user already reads a lot of gets credit.
+        author_read_counts = Counter(
+            a for a in (author_id_arr[i] for i in history_indices) if a is not None
+        )
+
         # A. LightGCN Scores (embeddings never trained on label_pos_indices)
         u_vec_gcn = user_embs_gcn[u_idx]
         lightgcn_scores = np.dot(book_embs_gcn, u_vec_gcn)
@@ -120,6 +146,7 @@ def build_hard_negative_dataset():
         # E. Build Training Rows
         for b_idx in all_candidate_indices:
             is_positive = 1 if b_idx in label_pos_indices else 0
+            candidate_author = author_id_arr[b_idx]
 
             dataset_rows.append({
                 'user_idx': u_idx,
@@ -130,6 +157,9 @@ def build_hard_negative_dataset():
                 'fused_score': fused_scores[b_idx],
                 'user_avg_rating': u_meta['user_avg_rating'],
                 'user_explicit_rating_count': u_count,
+                'author_read_count': author_read_counts.get(candidate_author, 0) if candidate_author is not None else 0,
+                'book_average_rating': avg_rating_arr[b_idx],
+                'book_log_ratings_count': log_ratings_count_arr[b_idx],
                 'reference_year': ref_year  # CONSISTENT REFERENCE YEAR FOR ALL CANDIDATES
             })
 
@@ -147,9 +177,10 @@ def build_hard_negative_dataset():
     df_combined['book_age_at_interaction'].fillna(0, inplace=True)
     
     final_cols = [
-        'user_idx', 'book_idx', 'target', 
+        'user_idx', 'book_idx', 'target',
         'lightgcn_score', 'semantic_score', 'fused_score',
-        'user_avg_rating', 'user_explicit_rating_count', 
+        'user_avg_rating', 'user_explicit_rating_count',
+        'author_read_count', 'book_average_rating', 'book_log_ratings_count',
         'is_long_book', 'book_age_at_interaction'
     ]
     df_final = df_combined[final_cols]

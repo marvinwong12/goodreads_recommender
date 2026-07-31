@@ -1,5 +1,6 @@
 import sys
 import json
+from collections import Counter
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -41,9 +42,10 @@ def evaluate():
     
     # 1. Load Data
     interactions = pd.read_parquet(PROCESSED_DIR / "interactions_clean.parquet")
+    books = pd.read_parquet(PROCESSED_DIR / "books_clean.parquet")
     book_map = pd.read_parquet(GRAPH_DIR / "book_mapping.parquet")
     user_map = pd.read_parquet(GRAPH_DIR / "user_mapping.parquet")
-    
+
     num_books = len(book_map)
     
     # 2. Load Embeddings
@@ -63,7 +65,25 @@ def evaluate():
             
     norms = np.linalg.norm(aligned_sem_embs, axis=1, keepdims=True)
     aligned_sem_embs = np.divide(aligned_sem_embs, norms, out=np.zeros_like(aligned_sem_embs), where=norms!=0)
-    
+
+    # Static per-book arrays: author id (for user-author affinity) and global
+    # popularity priors (avg rating / log ratings count), indexed by book_idx.
+    book_meta_global = book_map.merge(
+        books[['book_id', 'primary_author_id', 'average_rating', 'ratings_count']],
+        on='book_id', how='left'
+    )
+    author_id_arr = np.full(num_books, None, dtype=object)
+    avg_rating_arr = np.full(num_books, books['average_rating'].mean(), dtype=np.float64)
+    log_ratings_count_arr = np.zeros(num_books, dtype=np.float64)
+
+    for row in book_meta_global.itertuples(index=False):
+        b_idx = int(row.book_idx)
+        author_id_arr[b_idx] = row.primary_author_id
+        if pd.notnull(row.average_rating):
+            avg_rating_arr[b_idx] = row.average_rating
+        if pd.notnull(row.ratings_count):
+            log_ratings_count_arr[b_idx] = np.log1p(row.ratings_count)
+
     # 3. Load Trained Ranker
     ranker = xgb.XGBRanker()
     ranker.load_model(XGBOOST_DIR / "ranker_model.json")
@@ -103,6 +123,7 @@ def evaluate():
     feature_names = [
         'lightgcn_score', 'semantic_score', 'fused_score',
         'user_avg_rating', 'user_explicit_rating_count',
+        'author_read_count', 'book_average_rating', 'book_log_ratings_count',
     ]
     
     for u_idx in tqdm(test_users):
@@ -114,7 +135,11 @@ def evaluate():
             
         u_meta = user_metadata_dict.get(u_idx, {'user_avg_rating': 3.5, 'user_explicit_rating_count': 1})
         u_count = u_meta['user_explicit_rating_count']
-        
+
+        author_read_counts = Counter(
+            a for a in (author_id_arr[i] for i in train_pos_indices) if a is not None
+        )
+
         # --- STAGE 1: Candidate Generation ---
         u_vec_gcn = user_embs_gcn[u_idx]
         lightgcn_scores = np.dot(book_embs_gcn, u_vec_gcn)
@@ -148,9 +173,15 @@ def evaluate():
         c_fused = fused_scores[candidate_indices]
         c_u_avg = np.full(STAGE_1_TOP_K, u_meta['user_avg_rating'])
         c_u_cnt = np.full(STAGE_1_TOP_K, u_count)
+        c_author_read = np.array([
+            author_read_counts.get(author_id_arr[b_idx], 0) for b_idx in candidate_indices
+        ])
+        c_book_avg_rating = avg_rating_arr[candidate_indices]
+        c_book_log_ratings_count = log_ratings_count_arr[candidate_indices]
 
         X_candidates_np = np.column_stack((
-            c_lightgcn, c_semantic, c_fused, c_u_avg, c_u_cnt
+            c_lightgcn, c_semantic, c_fused, c_u_avg, c_u_cnt,
+            c_author_read, c_book_avg_rating, c_book_log_ratings_count
         ))
         
         X_candidates = pd.DataFrame(X_candidates_np, columns=feature_names)
