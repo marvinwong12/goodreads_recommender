@@ -20,7 +20,6 @@ XGBOOST_DIR = PROJECT_ROOT / "models" / "xgboost"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
 STAGE_1_TOP_K = 100
-INFERENCE_YEAR = 2024  # Used to calculate book age during live inference
 
 def compute_ndcg_at_k(actual_hits, k):
     if not actual_hits:
@@ -42,7 +41,6 @@ def evaluate():
     
     # 1. Load Data
     interactions = pd.read_parquet(PROCESSED_DIR / "interactions_clean.parquet")
-    books = pd.read_parquet(PROCESSED_DIR / "books_clean.parquet")
     book_map = pd.read_parquet(GRAPH_DIR / "book_mapping.parquet")
     user_map = pd.read_parquet(GRAPH_DIR / "user_mapping.parquet")
     
@@ -80,20 +78,7 @@ def evaluate():
     user_metadata_dict = train_positives[['user_idx', 'user_avg_rating', 'user_explicit_rating_count']].drop_duplicates().set_index('user_idx').to_dict('index')
     user_to_train_pos = train_positives.groupby('user_idx')['book_idx'].apply(list).to_dict()
     user_to_test_pos = test_positives.groupby('user_idx')['book_idx'].apply(set).to_dict()
-    
-    # Static book feature arrays
-    book_meta = book_map.merge(books[['book_id', 'is_long_book', 'publication_year']], on='book_id', how='left')
-    
-    is_long_arr = np.zeros(num_books)
-    pub_year_arr = np.full(num_books, INFERENCE_YEAR)
-    
-    for _, row in book_meta.iterrows():
-        b_idx = int(row['book_idx'])
-        is_long_arr[b_idx] = row['is_long_book'] if pd.notnull(row['is_long_book']) else 0
-        pub_year_arr[b_idx] = row['publication_year'] if pd.notnull(row['publication_year']) else 2020
-        
-    book_age_arr = np.maximum(0, INFERENCE_YEAR - pub_year_arr)
-    
+
     test_users = list(user_to_test_pos.keys())
     print(f"Evaluating {len(test_users):,} test users...")
     
@@ -116,9 +101,8 @@ def evaluate():
         metrics[stage]['mrr@10'].append(mrr)
 
     feature_names = [
-        'lightgcn_score', 'semantic_score', 'fused_score', 
-        'user_avg_rating', 'user_explicit_rating_count', 
-        'is_long_book', 'book_age_at_interaction'
+        'lightgcn_score', 'semantic_score', 'fused_score',
+        'user_avg_rating', 'user_explicit_rating_count',
     ]
     
     for u_idx in tqdm(test_users):
@@ -164,11 +148,9 @@ def evaluate():
         c_fused = fused_scores[candidate_indices]
         c_u_avg = np.full(STAGE_1_TOP_K, u_meta['user_avg_rating'])
         c_u_cnt = np.full(STAGE_1_TOP_K, u_count)
-        c_is_long = is_long_arr[candidate_indices]
-        c_age = book_age_arr[candidate_indices]
-        
+
         X_candidates_np = np.column_stack((
-            c_lightgcn, c_semantic, c_fused, c_u_avg, c_u_cnt, c_is_long, c_age
+            c_lightgcn, c_semantic, c_fused, c_u_avg, c_u_cnt
         ))
         
         X_candidates = pd.DataFrame(X_candidates_np, columns=feature_names)

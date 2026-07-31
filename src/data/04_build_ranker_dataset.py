@@ -111,7 +111,11 @@ def build_hard_negative_dataset():
         candidate_scores = fused_scores.copy()
         candidate_scores[history_indices] = -np.inf
         top_k_indices = np.argpartition(candidate_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
-        all_candidate_indices = set(top_k_indices).union(set(label_pos_indices))
+        # Positives outside the natural top-K are stage-1 recall misses that
+        # stage 2 never sees in production (candidate generation is strictly
+        # top-K); training on them as forced positives taught the ranker that
+        # stage-1 scores are unreliable, wrecking eval-time reranking.
+        all_candidate_indices = set(top_k_indices)
 
         # E. Build Training Rows
         for b_idx in all_candidate_indices:

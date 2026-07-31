@@ -27,8 +27,6 @@ FEATURES = [
     'fused_score',
     'user_avg_rating',
     'user_explicit_rating_count',
-    'is_long_book',
-    'book_age_at_interaction'
 ]
 
 # Force non-decreasing relevance w.r.t. the three stage-1 score features.
