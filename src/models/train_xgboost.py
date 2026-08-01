@@ -30,6 +30,7 @@ FEATURES = [
     'author_read_count',
     'book_average_rating',
     'book_log_ratings_count',
+    'cooccurrence_score',
 ]
 
 # Force non-decreasing relevance w.r.t. the stage-1 score features and the
@@ -42,7 +43,7 @@ FEATURES = [
 # 1 = monotonic increasing, 0 = unconstrained.
 MONOTONE_FEATURES = {
     'lightgcn_score', 'semantic_score', 'fused_score',
-    'book_average_rating', 'book_log_ratings_count',
+    'book_average_rating', 'book_log_ratings_count', 'cooccurrence_score',
 }
 MONOTONE_CONSTRAINTS = tuple(1 if f in MONOTONE_FEATURES else 0 for f in FEATURES)
 

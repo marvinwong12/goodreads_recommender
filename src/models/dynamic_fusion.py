@@ -21,6 +21,34 @@ def min_max_normalize(scores: np.ndarray) -> np.ndarray:
     scaled[finite_mask] = (scores[finite_mask] - min_val) / denom
     return scaled
 
+def recency_weighted_profile(embeddings, ordered_book_indices, decay_rate=0.9):
+    """
+    Builds a user's semantic profile as an exponentially recency-weighted
+    average of their read books' embeddings, instead of a plain mean. A flat
+    mean dilutes short-term taste shifts (e.g. a genre binge, moving on to a
+    new series) into an all-time average; weighting recent reads more heavily
+    keeps the profile responsive to what the user is currently into.
+
+    Args:
+        embeddings (np.ndarray): Book embedding matrix (num_books, dim).
+        ordered_book_indices (list[int]): The user's read book indices,
+            ordered oldest -> most recent.
+        decay_rate (float): Weight ratio between consecutive reads; the most
+            recent read gets weight 1, each earlier one decays by this factor.
+
+    Returns:
+        profile (np.ndarray): L2-normalized weighted profile vector.
+    """
+    n = len(ordered_book_indices)
+    weights = decay_rate ** np.arange(n - 1, -1, -1)
+    weights = weights / weights.sum()
+    profile = (embeddings[ordered_book_indices] * weights[:, None]).sum(axis=0)
+    norm = np.linalg.norm(profile)
+    if norm > 0:
+        profile = profile / norm
+    return profile
+
+
 def fuse_scores(lightgcn_scores, semantic_scores, user_interaction_count, decay_rate=0.05, min_alpha=0.15):
     """
     Blends collaborative and semantic scores dynamically.

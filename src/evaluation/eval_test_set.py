@@ -11,7 +11,8 @@ CURRENT_FILE = Path(__file__).resolve()
 PROJECT_ROOT = CURRENT_FILE.parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.models.dynamic_fusion import fuse_scores
+from src.models.dynamic_fusion import fuse_scores, recency_weighted_profile
+from src.models.item_cf import load_item_similarity, score_candidates as score_cooccurrence_candidates
 
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 GRAPH_DIR = PROCESSED_DIR / "graph"
@@ -20,7 +21,7 @@ VECTOR_DB_DIR = PROJECT_ROOT / "models" / "vector_index"
 XGBOOST_DIR = PROJECT_ROOT / "models" / "xgboost"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
-STAGE_1_TOP_K = 100
+STAGE_1_TOP_K = 200  # widened from 100: directly raises the stage-1 recall ceiling
 
 def compute_ndcg_at_k(actual_hits, k):
     if not actual_hits:
@@ -84,6 +85,9 @@ def evaluate():
         if pd.notnull(row.ratings_count):
             log_ratings_count_arr[b_idx] = np.log1p(row.ratings_count)
 
+    print("Loading item-item co-occurrence similarity matrix...")
+    item_sim = load_item_similarity()
+
     # 3. Load Trained Ranker
     ranker = xgb.XGBRanker()
     ranker.load_model(XGBOOST_DIR / "ranker_model.json")
@@ -96,6 +100,9 @@ def evaluate():
     test_positives = test_interactions.merge(user_map, on='user_id').merge(book_map, on='book_id')
     
     user_metadata_dict = train_positives[['user_idx', 'user_avg_rating', 'user_explicit_rating_count']].drop_duplicates().set_index('user_idx').to_dict('index')
+    # Sorted oldest -> most recent per user so the recency-weighted semantic
+    # profile can weight later reads more heavily.
+    train_positives = train_positives.sort_values(['user_idx', 'interaction_date'])
     user_to_train_pos = train_positives.groupby('user_idx')['book_idx'].apply(list).to_dict()
     user_to_test_pos = test_positives.groupby('user_idx')['book_idx'].apply(set).to_dict()
 
@@ -124,6 +131,7 @@ def evaluate():
         'lightgcn_score', 'semantic_score', 'fused_score',
         'user_avg_rating', 'user_explicit_rating_count',
         'author_read_count', 'book_average_rating', 'book_log_ratings_count',
+        'cooccurrence_score',
     ]
     
     for u_idx in tqdm(test_users):
@@ -143,36 +151,44 @@ def evaluate():
         # --- STAGE 1: Candidate Generation ---
         u_vec_gcn = user_embs_gcn[u_idx]
         lightgcn_scores = np.dot(book_embs_gcn, u_vec_gcn)
-        
-        user_sem_profile = np.mean(aligned_sem_embs[train_pos_indices], axis=0)
-        profile_norm = np.linalg.norm(user_sem_profile)
-        if profile_norm > 0:
-            user_sem_profile = user_sem_profile / profile_norm
+
+        # Recency-weighted profile (weights toward most recent reads) instead
+        # of a flat mean over all-time history.
+        user_sem_profile = recency_weighted_profile(aligned_sem_embs, train_pos_indices)
         semantic_scores = np.dot(aligned_sem_embs, user_sem_profile)
-        
+
         # 1. FUSE RAW SCORES FIRST (Prevents NaNs during min-max scaling)
         fused_scores, _ = fuse_scores(lightgcn_scores, semantic_scores, u_count)
-        
+
+        # Second, independent retrieval channel: item-item co-occurrence.
+        cooccurrence_scores = score_cooccurrence_candidates(item_sim, train_pos_indices)
+
         # 2. MASK TRAINED HISTORY AFTER FUSION
         lightgcn_scores[train_pos_indices] = -np.inf
         semantic_scores[train_pos_indices] = -np.inf
         fused_scores[train_pos_indices] = -np.inf
-        
-        # 3. Retrieve Top K candidates
-        candidate_indices = np.argpartition(fused_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
+        cooccurrence_scores[train_pos_indices] = -np.inf
 
-        # --- BASELINE: Fused-score-only ranking (no XGBoost re-ranking) ---
-        fused_order = np.argsort(fused_scores[candidate_indices])[::-1]
-        fused_ranked_book_indices = candidate_indices[fused_order]
+        # 3. Retrieve Top K candidates per channel
+        fused_candidate_indices = np.argpartition(fused_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
+        cooc_candidate_indices = np.argpartition(cooccurrence_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
+
+        # --- BASELINE: Fused-score-only ranking (no XGBoost re-ranking, single channel) ---
+        fused_order = np.argsort(fused_scores[fused_candidate_indices])[::-1]
+        fused_ranked_book_indices = fused_candidate_indices[fused_order]
         fused_hits_binary = [b_idx in ground_truth_set for b_idx in fused_ranked_book_indices]
         record_metrics('fused', fused_hits_binary)
 
-        # --- STAGE 2: Vectorized XGBoost Re-ranking ---
+        # --- STAGE 2: Vectorized XGBoost Re-ranking over the unioned candidate pool ---
+        candidate_indices = np.array(list(set(fused_candidate_indices) | set(cooc_candidate_indices)))
+        n_candidates = len(candidate_indices)
+
         c_lightgcn = lightgcn_scores[candidate_indices]
         c_semantic = semantic_scores[candidate_indices]
         c_fused = fused_scores[candidate_indices]
-        c_u_avg = np.full(STAGE_1_TOP_K, u_meta['user_avg_rating'])
-        c_u_cnt = np.full(STAGE_1_TOP_K, u_count)
+        c_cooc = cooccurrence_scores[candidate_indices]
+        c_u_avg = np.full(n_candidates, u_meta['user_avg_rating'])
+        c_u_cnt = np.full(n_candidates, u_count)
         c_author_read = np.array([
             author_read_counts.get(author_id_arr[b_idx], 0) for b_idx in candidate_indices
         ])
@@ -181,16 +197,16 @@ def evaluate():
 
         X_candidates_np = np.column_stack((
             c_lightgcn, c_semantic, c_fused, c_u_avg, c_u_cnt,
-            c_author_read, c_book_avg_rating, c_book_log_ratings_count
+            c_author_read, c_book_avg_rating, c_book_log_ratings_count, c_cooc
         ))
-        
+
         X_candidates = pd.DataFrame(X_candidates_np, columns=feature_names)
         ranker_scores = ranker.predict(X_candidates)
 
         # Sort by ranker scores (Descending)
         reranked_order = np.argsort(ranker_scores)[::-1]
         final_ranked_book_indices = candidate_indices[reranked_order]
-        
+
         # --- METRIC COMPUTATION ---
         hits_binary = [b_idx in ground_truth_set for b_idx in final_ranked_book_indices]
         record_metrics('xgboost', hits_binary)

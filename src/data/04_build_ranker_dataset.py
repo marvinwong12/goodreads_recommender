@@ -9,14 +9,15 @@ CURRENT_FILE = Path(__file__).resolve()
 PROJECT_ROOT = CURRENT_FILE.parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.models.dynamic_fusion import fuse_scores
+from src.models.dynamic_fusion import fuse_scores, recency_weighted_profile
+from src.models.item_cf import load_item_similarity, score_candidates as score_cooccurrence_candidates
 
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 GRAPH_DIR = PROCESSED_DIR / "graph"
 LIGHTGCN_DIR = PROJECT_ROOT / "models" / "lightgcn"
 VECTOR_DB_DIR = PROJECT_ROOT / "models" / "vector_index"
 
-STAGE_1_TOP_K = 100
+STAGE_1_TOP_K = 200  # widened from 100: directly raises the stage-1 recall ceiling
 MAX_DATASET_YEAR = 2017  # Anchors reference year to dataset max interaction year
 
 def build_hard_negative_dataset():
@@ -67,6 +68,9 @@ def build_hard_negative_dataset():
         if pd.notnull(row.ratings_count):
             log_ratings_count_arr[b_idx] = np.log1p(row.ratings_count)
 
+    print("Loading item-item co-occurrence similarity matrix...")
+    item_sim = load_item_similarity()
+
     # 2. Prepare User Interaction Data
     #
     # --- LEAK FIX: disjoint history vs. label windows ---
@@ -85,6 +89,9 @@ def build_hard_negative_dataset():
     ].merge(user_map, on='user_id').merge(book_map, on='book_id')
 
     user_metadata_dict = history_interactions[['user_idx', 'user_avg_rating', 'user_explicit_rating_count']].drop_duplicates().set_index('user_idx').to_dict('index')
+    # Sorted oldest -> most recent per user so the recency-weighted semantic
+    # profile can weight later reads more heavily.
+    history_interactions = history_interactions.sort_values(['user_idx', 'interaction_date'])
     user_to_history = history_interactions.groupby('user_idx')['book_idx'].apply(list).to_dict()
     user_to_labels = label_interactions.groupby('user_idx')['book_idx'].apply(list).to_dict()
 
@@ -120,28 +127,35 @@ def build_hard_negative_dataset():
         u_vec_gcn = user_embs_gcn[u_idx]
         lightgcn_scores = np.dot(book_embs_gcn, u_vec_gcn)
 
-        # B. Semantic Scores (profile built purely from pre-cutoff history)
-        user_sem_profile = np.mean(aligned_sem_embs[history_indices], axis=0)
-        profile_norm = np.linalg.norm(user_sem_profile)
-        if profile_norm > 0:
-            user_sem_profile /= profile_norm
-
+        # B. Semantic Scores (profile built purely from pre-cutoff history,
+        # weighted toward the user's most recent reads rather than an
+        # all-time flat mean)
+        user_sem_profile = recency_weighted_profile(aligned_sem_embs, history_indices)
         semantic_scores = np.dot(aligned_sem_embs, user_sem_profile)
 
         # C. Fuse Scores
         fused_scores, _ = fuse_scores(lightgcn_scores, semantic_scores, u_count)
 
-        # D. Get Top K Candidate Indices, excluding books already in the user's
-        # known history (mirrors real candidate generation, which never
-        # re-recommends already-read books).
+        # D. Two independent retrieval channels, unioned (mirrors production
+        # multi-channel retrieval): the fused LightGCN+semantic score, and an
+        # item-item co-occurrence channel ("readers of your history also
+        # read..."). Each channel recalls a different slice of relevant
+        # candidates. Both exclude books already in the user's known history.
+        cooccurrence_scores = score_cooccurrence_candidates(item_sim, history_indices)
+
         candidate_scores = fused_scores.copy()
         candidate_scores[history_indices] = -np.inf
-        top_k_indices = np.argpartition(candidate_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
-        # Positives outside the natural top-K are stage-1 recall misses that
-        # stage 2 never sees in production (candidate generation is strictly
-        # top-K); training on them as forced positives taught the ranker that
-        # stage-1 scores are unreliable, wrecking eval-time reranking.
-        all_candidate_indices = set(top_k_indices)
+        fused_top_k_indices = np.argpartition(candidate_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
+
+        cooccurrence_scores[history_indices] = -np.inf
+        cooc_top_k_indices = np.argpartition(cooccurrence_scores, -STAGE_1_TOP_K)[-STAGE_1_TOP_K:]
+
+        # Positives outside the natural top-K (of either channel) are stage-1
+        # recall misses that stage 2 never sees in production (candidate
+        # generation is strictly top-K); training on them as forced positives
+        # taught the ranker that stage-1 scores are unreliable, wrecking
+        # eval-time reranking.
+        all_candidate_indices = set(fused_top_k_indices) | set(cooc_top_k_indices)
 
         # E. Build Training Rows
         for b_idx in all_candidate_indices:
@@ -160,6 +174,7 @@ def build_hard_negative_dataset():
                 'author_read_count': author_read_counts.get(candidate_author, 0) if candidate_author is not None else 0,
                 'book_average_rating': avg_rating_arr[b_idx],
                 'book_log_ratings_count': log_ratings_count_arr[b_idx],
+                'cooccurrence_score': cooccurrence_scores[b_idx],
                 'reference_year': ref_year  # CONSISTENT REFERENCE YEAR FOR ALL CANDIDATES
             })
 
@@ -181,7 +196,7 @@ def build_hard_negative_dataset():
         'lightgcn_score', 'semantic_score', 'fused_score',
         'user_avg_rating', 'user_explicit_rating_count',
         'author_read_count', 'book_average_rating', 'book_log_ratings_count',
-        'is_long_book', 'book_age_at_interaction'
+        'cooccurrence_score', 'is_long_book', 'book_age_at_interaction'
     ]
     df_final = df_combined[final_cols]
     
