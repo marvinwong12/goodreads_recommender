@@ -108,7 +108,7 @@ def objective(trial, X_train, y_train, qid_train, X_val, y_val, qid_val):
 
 def train():
     print("Loading tabular dataset...")
-    df = pd.read_parquet(DATA_DIR / "xgboost_dataset.parquet")
+    df = pd.read_parquet(DATA_DIR / "xgboost_dataset")  # directory of chunked part files
 
     features = FEATURES
 

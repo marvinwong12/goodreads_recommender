@@ -21,14 +21,18 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 GRAPH_DIR = PROCESSED_DIR / "graph"
 ITEM_CF_DIR = PROJECT_ROOT / "models" / "item_cf"
 
-TOP_N_NEIGHBORS = 50
+TOP_N_NEIGHBORS = 5
 
 # Caps the per-user history used to build the book-book co-occurrence matrix.
 # Matmul cost scales with sum(user_degree^2), and a handful of power users
 # with thousands of reads would otherwise dominate that cost; using each
 # user's most recent MAX_HISTORY_PER_USER reads keeps the matrix cheap to
 # build while still capturing current taste.
-MAX_HISTORY_PER_USER = 100
+# Both constants tuned via offline sweep against a naive fused+cooccurrence
+# blend baseline: tighter neighbor lists and shorter, more recent history
+# outperformed the original (50, 100) defaults on HR@5/10, with quality
+# (NDCG/MRR) starting to degrade below top_n=5 despite HR still creeping up.
+MAX_HISTORY_PER_USER = 50
 
 
 def build_item_similarity():

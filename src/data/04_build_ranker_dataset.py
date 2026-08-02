@@ -20,6 +20,12 @@ VECTOR_DB_DIR = PROJECT_ROOT / "models" / "vector_index"
 STAGE_1_TOP_K = 200  # widened from 100: directly raises the stage-1 recall ceiling
 MAX_DATASET_YEAR = 2017  # Anchors reference year to dataset max interaction year
 
+# Rows are flushed to disk in chunks instead of being accumulated as one giant
+# list of Python dicts (which OOM'd at ~50M+ rows on a 16GB machine). Output
+# becomes a directory of part files; pandas/pyarrow read a directory of
+# parquet files transparently as one dataset.
+CHUNK_USERS = 15000
+
 def build_hard_negative_dataset():
     print("Loading datasets and mappings...")
     interactions = pd.read_parquet(PROCESSED_DIR / "interactions_clean.parquet")
@@ -53,12 +59,14 @@ def build_hard_negative_dataset():
     # popularity priors (avg rating / log ratings count), indexed by book_idx.
     print("Building static book feature arrays...")
     book_meta_global = book_map.merge(
-        books[['book_id', 'primary_author_id', 'average_rating', 'ratings_count']],
+        books[['book_id', 'primary_author_id', 'average_rating', 'ratings_count', 'is_long_book', 'publication_year']],
         on='book_id', how='left'
     )
     author_id_arr = np.full(num_books, None, dtype=object)
     avg_rating_arr = np.full(num_books, books['average_rating'].mean(), dtype=np.float64)
     log_ratings_count_arr = np.zeros(num_books, dtype=np.float64)
+    is_long_arr = np.zeros(num_books, dtype=np.float64)
+    pub_year_arr = np.full(num_books, np.nan, dtype=np.float64)
 
     for row in book_meta_global.itertuples(index=False):
         b_idx = int(row.book_idx)
@@ -67,6 +75,10 @@ def build_hard_negative_dataset():
             avg_rating_arr[b_idx] = row.average_rating
         if pd.notnull(row.ratings_count):
             log_ratings_count_arr[b_idx] = np.log1p(row.ratings_count)
+        if pd.notnull(row.is_long_book):
+            is_long_arr[b_idx] = row.is_long_book
+        if pd.notnull(row.publication_year):
+            pub_year_arr[b_idx] = row.publication_year
 
     print("Loading item-item co-occurrence similarity matrix...")
     item_sim = load_item_similarity()
@@ -100,14 +112,40 @@ def build_hard_negative_dataset():
     # generation time, bounded by the GCN-fit cutoff year.
     user_max_year = history_interactions.groupby('user_idx')['interaction_year'].max().clip(upper=MAX_DATASET_YEAR).to_dict()
 
-    dataset_rows = []
+    out_dir = PROCESSED_DIR / "xgboost_dataset"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("part_*.parquet"):
+        existing.unlink()
+
+    columns = [
+        'user_idx', 'book_idx', 'target',
+        'lightgcn_score', 'semantic_score', 'fused_score',
+        'user_avg_rating', 'user_explicit_rating_count',
+        'author_read_count', 'book_average_rating', 'book_log_ratings_count',
+        'cooccurrence_score', 'is_long_book', 'book_age_at_interaction',
+    ]
+    buffers = {c: [] for c in columns}
+    chunk_idx = 0
+    total_positives = 0
+    total_rows = 0
+
+    def flush_chunk():
+        nonlocal chunk_idx
+        if not buffers['user_idx']:
+            return
+        chunk_df = pd.DataFrame(buffers)
+        chunk_df.to_parquet(out_dir / f"part_{chunk_idx:04d}.parquet", index=False)
+        chunk_idx += 1
+        for c in columns:
+            buffers[c].clear()
+
     # Only users who both appear in the graph (had >=k-core history edges) and
     # have at least one held-out label interaction can produce training rows.
     unique_users = [u for u in user_to_labels.keys() if u in user_to_history]
 
     print(f"Mining leakage-free hard negatives for {len(unique_users):,} users...")
 
-    for u_idx in tqdm(unique_users):
+    for loop_i, u_idx in enumerate(tqdm(unique_users)):
         history_indices = user_to_history.get(u_idx, [])
         label_pos_indices = user_to_labels.get(u_idx, [])
         if not history_indices or not label_pos_indices:
@@ -162,50 +200,37 @@ def build_hard_negative_dataset():
             is_positive = 1 if b_idx in label_pos_indices else 0
             candidate_author = author_id_arr[b_idx]
 
-            dataset_rows.append({
-                'user_idx': u_idx,
-                'book_idx': b_idx,
-                'target': is_positive,
-                'lightgcn_score': lightgcn_scores[b_idx],
-                'semantic_score': semantic_scores[b_idx],
-                'fused_score': fused_scores[b_idx],
-                'user_avg_rating': u_meta['user_avg_rating'],
-                'user_explicit_rating_count': u_count,
-                'author_read_count': author_read_counts.get(candidate_author, 0) if candidate_author is not None else 0,
-                'book_average_rating': avg_rating_arr[b_idx],
-                'book_log_ratings_count': log_ratings_count_arr[b_idx],
-                'cooccurrence_score': cooccurrence_scores[b_idx],
-                'reference_year': ref_year  # CONSISTENT REFERENCE YEAR FOR ALL CANDIDATES
-            })
+            pub_year = pub_year_arr[b_idx]
+            book_age = max(0.0, ref_year - pub_year) if not np.isnan(pub_year) else 0.0
 
-    print("Converting to DataFrame...")
-    df_combined = pd.DataFrame(dataset_rows)
-    
-    print("Merging Book Metadata...")
-    df_combined = df_combined.merge(book_map, on='book_idx')
-    df_combined = df_combined.merge(books[['book_id', 'is_long_book', 'publication_year']], on='book_id', how='left')
-    
-    # --- LEAK FIX: Calculate age using consistent reference year for BOTH positives and negatives ---
-    df_combined['book_age_at_interaction'] = np.maximum(
-        0, df_combined['reference_year'] - df_combined['publication_year']
-    )
-    df_combined['book_age_at_interaction'].fillna(0, inplace=True)
-    
-    final_cols = [
-        'user_idx', 'book_idx', 'target',
-        'lightgcn_score', 'semantic_score', 'fused_score',
-        'user_avg_rating', 'user_explicit_rating_count',
-        'author_read_count', 'book_average_rating', 'book_log_ratings_count',
-        'cooccurrence_score', 'is_long_book', 'book_age_at_interaction'
-    ]
-    df_final = df_combined[final_cols]
-    
-    out_path = PROCESSED_DIR / "xgboost_dataset.parquet"
-    df_final.to_parquet(out_path, index=False)
-    
+            buffers['user_idx'].append(u_idx)
+            buffers['book_idx'].append(b_idx)
+            buffers['target'].append(is_positive)
+            buffers['lightgcn_score'].append(lightgcn_scores[b_idx])
+            buffers['semantic_score'].append(semantic_scores[b_idx])
+            buffers['fused_score'].append(fused_scores[b_idx])
+            buffers['user_avg_rating'].append(u_meta['user_avg_rating'])
+            buffers['user_explicit_rating_count'].append(u_count)
+            buffers['author_read_count'].append(
+                author_read_counts.get(candidate_author, 0) if candidate_author is not None else 0
+            )
+            buffers['book_average_rating'].append(avg_rating_arr[b_idx])
+            buffers['book_log_ratings_count'].append(log_ratings_count_arr[b_idx])
+            buffers['cooccurrence_score'].append(cooccurrence_scores[b_idx])
+            buffers['is_long_book'].append(is_long_arr[b_idx])
+            buffers['book_age_at_interaction'].append(book_age)
+
+            total_positives += is_positive
+            total_rows += 1
+
+        if (loop_i + 1) % CHUNK_USERS == 0:
+            flush_chunk()
+
+    flush_chunk()
+
     print(f"\n✓ Leak-free dataset generated!")
-    print(f"  Saved to: {out_path}")
-    print(f"  Positives: {len(df_final[df_final['target'] == 1]):,} | Hard Negatives: {len(df_final[df_final['target'] == 0]):,}")
+    print(f"  Saved to: {out_dir} ({chunk_idx} part files)")
+    print(f"  Positives: {total_positives:,} | Hard Negatives: {total_rows - total_positives:,}")
 
 if __name__ == "__main__":
     build_hard_negative_dataset()
