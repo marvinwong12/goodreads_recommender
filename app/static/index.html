@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Request Card · Goodreads Recommender</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,500;0,8..60,600;1,8..60,500&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #e8e0cd;
+    --card: #f3ecdb;
+    --ink: #2a2318;
+    --ink-dim: #6e6249;
+    --stamp: #8c2f39;
+    --stamp-ink: #7a2732;
+    --rule: #c7b98f;
+    --tab: #d8c9a0;
+    --shadow: rgba(42, 35, 24, 0.14);
+  }
+  :root[data-theme="dark"] {
+    --paper: #1c1812;
+    --card: #262019;
+    --ink: #ece2c9;
+    --ink-dim: #a89876;
+    --stamp: #e0808c;
+    --stamp-ink: #e69aa4;
+    --rule: #493f2c;
+    --tab: #3a3121;
+    --shadow: rgba(0, 0, 0, 0.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #1c1812;
+      --card: #262019;
+      --ink: #ece2c9;
+      --ink-dim: #a89876;
+      --stamp: #e0808c;
+      --stamp-ink: #e69aa4;
+      --rule: #493f2c;
+      --tab: #3a3121;
+      --shadow: rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    background-image:
+      repeating-linear-gradient(0deg, transparent, transparent 27px, var(--rule) 27px, var(--rule) 28px);
+    background-attachment: local;
+    color: var(--ink);
+    min-height: 100vh;
+    font-family: "Source Serif 4", Georgia, serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 660px;
+    margin: 0 auto;
+    padding: 56px 20px 90px;
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--stamp);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-size: 1.9rem;
+    font-weight: 600;
+    line-height: 1.25;
+    margin: 0 0 6px;
+    max-width: 20ch;
+  }
+  .subtitle {
+    color: var(--ink-dim);
+    margin: 0 0 36px;
+    font-size: 0.98rem;
+    max-width: 46ch;
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    box-shadow: 0 10px 26px var(--shadow);
+    padding: 26px 24px 22px;
+    margin-bottom: 30px;
+    position: relative;
+  }
+  /* punch holes, like a real index card */
+  .card::before, .card::after {
+    content: "";
+    position: absolute;
+    top: 14px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+  }
+  .card::before { left: 14px; }
+  .card::after { left: 30px; }
+
+  label {
+    display: block;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin: 4px 0 10px 32px;
+  }
+
+  .search-box { position: relative; margin-left: 32px; }
+  input[type="text"] {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 2px;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.9rem;
+    outline: none;
+  }
+  input[type="text"]::placeholder { color: var(--ink-dim); opacity: 0.7; }
+  input[type="text"]:focus { border-color: var(--stamp); }
+
+  .dropdown {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    max-height: 260px;
+    overflow-y: auto;
+    z-index: 10;
+    box-shadow: 0 8px 24px var(--shadow);
+  }
+  .dropdown-item {
+    padding: 9px 12px;
+    cursor: pointer;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+    border-bottom: 1px dashed var(--rule);
+  }
+  .dropdown-item:last-child { border-bottom: none; }
+  .dropdown-item:hover { background: var(--tab); }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 16px 0 0 32px;
+    min-height: 20px;
+  }
+  .chip {
+    background: var(--tab);
+    border-radius: 2px 2px 0 0;
+    padding: 6px 10px 6px 12px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.78rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 2px solid var(--stamp);
+  }
+  .chip button {
+    background: none;
+    border: none;
+    color: var(--ink-dim);
+    cursor: pointer;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0;
+  }
+  .chip button:hover { color: var(--ink); }
+
+  .go-btn {
+    margin: 22px 0 0 32px;
+    width: calc(100% - 32px);
+    padding: 12px;
+    border-radius: 2px;
+    border: none;
+    background: var(--stamp);
+    color: var(--card);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.08s ease, background 0.15s ease;
+  }
+  .go-btn:hover:not(:disabled) { background: var(--stamp-ink); }
+  .go-btn:active:not(:disabled) { transform: scale(0.997); }
+  .go-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .go-btn:focus-visible, input:focus-visible, .dropdown-item:focus-visible {
+    outline: 2px solid var(--stamp);
+    outline-offset: 2px;
+  }
+
+  .status {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.78rem;
+    color: var(--ink-dim);
+    margin: 10px 0 0 32px;
+  }
+
+  .results-label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin: 0 0 12px 2px;
+  }
+  .results { display: flex; flex-direction: column; gap: 8px; }
+
+  .result-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 12px 4px;
+    border-bottom: 1px dotted var(--rule);
+    opacity: 0;
+    animation: riseIn 0.32s ease forwards;
+  }
+  .result-row:last-child { border-bottom: none; }
+
+  .stamp {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--stamp);
+    border: 1.5px solid var(--stamp);
+    border-radius: 3px;
+    padding: 2px 6px;
+    transform: rotate(-3deg);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .result-title {
+    font-size: 0.98rem;
+    line-height: 1.3;
+  }
+  .leader {
+    flex: 1;
+    border-bottom: 1px dotted var(--ink-dim);
+    height: 1px;
+    min-width: 16px;
+    transform: translateY(-4px);
+    opacity: 0.55;
+  }
+  .result-score {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.78rem;
+    color: var(--ink-dim);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+
+  .empty-state {
+    font-family: "IBM Plex Mono", monospace;
+    color: var(--ink-dim);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 20px 0;
+  }
+
+  @keyframes riseIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .result-row { animation: none; opacity: 1; }
+  }
+
+  @media (max-width: 480px) {
+    .result-title { font-size: 0.9rem; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <p class="eyebrow">Reader's Request Card</p>
+    <h1>What sci-fi/fantasy books should you read next?</h1>
+    <p class="subtitle">Add a few recent titles of sci-fi/fantasy books you loved and the catalog pulls what belongs on your shelf next. Rankings are done live by a two-stage retrieval and reranking model.</p>
+
+    <div class="card">
+      <label for="search-input">Titles on file</label>
+      <div class="search-box">
+        <input type="text" id="search-input" placeholder="Start typing a title…" autocomplete="off" />
+        <div class="dropdown" id="dropdown" style="display:none;"></div>
+      </div>
+      <div class="chips" id="chips"></div>
+      <button class="go-btn" id="go-btn" disabled>Pull recommendations</button>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div id="results-section" style="display:none;">
+      <p class="results-label">Filed under: recommended</p>
+      <div class="results" id="results"></div>
+    </div>
+  </div>
+
+<script>
+  const searchInput = document.getElementById('search-input');
+  const dropdown = document.getElementById('dropdown');
+  const chipsEl = document.getElementById('chips');
+  const goBtn = document.getElementById('go-btn');
+  const statusEl = document.getElementById('status');
+  const resultsEl = document.getElementById('results');
+  const resultsSection = document.getElementById('results-section');
+
+  const selected = new Map(); // book_id -> title
+  let debounceTimer = null;
+
+  function renderChips() {
+    chipsEl.innerHTML = '';
+    for (const [bookId, title] of selected.entries()) {
+      const chip = document.createElement('div');
+      chip.className = 'chip';
+      chip.innerHTML = `<span>${title}</span>`;
+      const removeBtn = document.createElement('button');
+      removeBtn.textContent = '✕';
+      removeBtn.setAttribute('aria-label', `Remove ${title}`);
+      removeBtn.onclick = () => {
+        selected.delete(bookId);
+        renderChips();
+      };
+      chip.appendChild(removeBtn);
+      chipsEl.appendChild(chip);
+    }
+    goBtn.disabled = selected.size === 0;
+  }
+
+  async function doSearch(query) {
+    if (!query.trim()) {
+      dropdown.style.display = 'none';
+      return;
+    }
+    const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=8`);
+    const items = await res.json();
+    if (!items.length) {
+      dropdown.style.display = 'none';
+      return;
+    }
+    dropdown.innerHTML = '';
+    for (const item of items) {
+      const el = document.createElement('div');
+      el.className = 'dropdown-item';
+      el.textContent = item.title;
+      el.onclick = () => {
+        selected.set(item.book_id, item.title);
+        renderChips();
+        searchInput.value = '';
+        dropdown.style.display = 'none';
+      };
+      dropdown.appendChild(el);
+    }
+    dropdown.style.display = 'block';
+  }
+
+  searchInput.addEventListener('input', (e) => {
+    clearTimeout(debounceTimer);
+    const query = e.target.value;
+    debounceTimer = setTimeout(() => doSearch(query), 200);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.search-box')) dropdown.style.display = 'none';
+  });
+
+  goBtn.addEventListener('click', async () => {
+    statusEl.textContent = 'Pulling from the catalog…';
+    resultsEl.innerHTML = '';
+    resultsSection.style.display = 'none';
+    goBtn.disabled = true;
+    try {
+      const res = await fetch('/api/recommend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ book_ids: Array.from(selected.keys()), top_k: 10 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Request failed');
+      statusEl.textContent = '';
+      resultsSection.style.display = 'block';
+      if (!data.length) {
+        resultsEl.innerHTML = '<div class="empty-state">No matches in the catalog for that combination.</div>';
+      }
+      data.forEach((rec, i) => {
+        const row = document.createElement('div');
+        row.className = 'result-row';
+        row.style.animationDelay = `${i * 35}ms`;
+        row.innerHTML = `
+          <span class="stamp">No. ${i + 1}</span>
+          <span class="result-title">${rec.title ?? '(untitled)'}</span>
+          <span class="leader"></span>
+          <span class="result-score">${rec.score.toFixed(3)}</span>
+        `;
+        resultsEl.appendChild(row);
+      });
+    } catch (err) {
+      statusEl.textContent = `Couldn't reach the stacks — ${err.message}`;
+    } finally {
+      goBtn.disabled = selected.size === 0;
+    }
+  });
+</script>
+</body>
+</html>
