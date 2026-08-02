@@ -9,6 +9,16 @@ pool, and a learned XGBoost reranker sorts that pool into a final top-10.
 Search for a few sci-fi/fantasy books you've enjoyed and get live
 recommendations.
 
+## Data
+
+Trained on the UCSD Goodreads interaction and review datasets:
+
+> Mengting Wan, Julian McAuley, "Item Recommendation on Monotonic Behavior
+> Chains", in RecSys'18.
+>
+> Mengting Wan, Rishabh Misra, Ndapa Nakashole, Julian McAuley, "Fine-Grained
+> Spoiler Detection from Large-Scale Review Corpora", in ACL'19.
+
 ## How it works
 
 **Stage 1 — retrieval.** Three independent channels each propose candidates,
@@ -97,3 +107,38 @@ To build and run the containerized version:
 ./deploy/prepare_deploy.sh
 cd deploy && docker build -t goodreads-recommender . && docker run -p 8000:8080 goodreads-recommender
 ```
+
+## Next steps / open questions
+
+This is a first working pipeline, not a finished one. Preliminary directions
+worth pursuing next:
+
+**Data**
+- Expand dataset to include whole catalog of genres, see if recommendation
+pipeline still holds up.
+
+**Modeling**
+- Replace the recency-*weighted* semantic profile (an exponential-decay
+  approximation of "recent taste") with a real sequence model (SASRec /
+  GRU4Rec / BERT4Rec) that learns order-dependent patterns directly, e.g.
+  genre binges or working through a series in order.
+- Add a fourth retrieval channel (ie. popularity/trending) and check whether
+  it recalls a meaningfully different slice of relevant candidates than the
+  three existing channels, the way co-occurrence did.
+
+**Features**
+- Investigate whether `book_average_rating` / `book_log_ratings_count`
+  should be interacted with user tenure (a new user may weight raw
+  popularity differently than an established one).
+
+**Evaluation**
+- All results are evaluated at this dataset's catalog scale (~110K books);
+  worth checking how recall/ranking quality degrades (or doesn't) as
+  `STAGE_1_TOP_K` and catalog size scale further.
+
+**Productionization**
+- Real users' interactions currently never update embeddings live. A
+  scheduled retrain is the realistic path, but it's worth defining how
+  often, and what a staleness/monitoring signal for "the graph needs
+  retraining" would look like.
+- No exposure/position-bias correction or diversity/business-rules layer

@@ -125,6 +125,15 @@ class RecommenderService:
         u_count = len(book_idx_list)
         u_avg_rating = user_avg_rating if user_avg_rating is not None else DEFAULT_USER_AVG_RATING
 
+        # Books already read, keyed by (title, author) rather than book_id --
+        # the catalog has multiple editions of the same book as separate
+        # entries, and a different edition of something the user just told us
+        # they read is not a recommendation.
+        read_keys = {
+            ((self.title_arr[b_idx] or "").strip().lower(), self.author_id_arr[b_idx])
+            for b_idx in book_idx_list
+        }
+
         author_read_counts = Counter(
             a for a in (self.author_id_arr[i] for i in book_idx_list) if a is not None
         )
@@ -168,17 +177,32 @@ class RecommenderService:
         X_df = pd.DataFrame(X, columns=FEATURE_NAMES)
         ranker_scores = self.ranker.predict(X_df)
 
-        order = np.argsort(ranker_scores)[::-1][:top_k]
-        top_indices = candidate_indices[order]
+        # The catalog has multiple editions of the same book as separate
+        # entries (same title+author, different book_id) -- dedupe so they
+        # don't compete for candidate slots that should only be filled once.
+        # Pull a wider slice than top_k since some will collapse together.
+        order = np.argsort(ranker_scores)[::-1][:top_k * 3]
 
-        return [
-            {
+        seen = set()
+        results = []
+        for i in order:
+            b_idx = candidate_indices[i]
+            key = (
+                (self.title_arr[b_idx] or "").strip().lower(),
+                self.author_id_arr[b_idx],
+            )
+            if key in seen or key in read_keys:
+                continue
+            seen.add(key)
+            results.append({
                 "book_id": self.book_idx_to_id[b_idx],
                 "title": self.title_arr[b_idx],
-                "score": float(ranker_scores[order[i]]),
-            }
-            for i, b_idx in enumerate(top_indices)
-        ]
+                "score": float(ranker_scores[i]),
+            })
+            if len(results) == top_k:
+                break
+
+        return results
 
 
 if __name__ == "__main__":
