@@ -11,22 +11,28 @@ seaborn
 wordcloud             
 
 # Machine Learning & Ranking
-scikit-learn             
-lightgbm                 
-# catboost            
+scikit-learn
+lightgbm
+# catboost
+optuna
+scipy
 
 # Deep Learning & Graph Neural Networks
-torch                  
-torch_geometric      
+torch
+torch_geometric
 
 
 # Embeddings & Vector Search (Semantic Retrieval)
-sentence-transformers    
-faiss-cpu             
+sentence-transformers
+faiss-cpu
 
 # MLOps & Utilities
-tqdm                  
-wandb              
-python-dotenv          
+tqdm
+wandb
+python-dotenv
 
 xgboost
+
+# Serving (app/, src/inference/)
+fastapi
+uvicorn[standard]
